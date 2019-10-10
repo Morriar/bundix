@@ -1,5 +1,3 @@
-require "pry"
-
 class Bundix
   class Fetcher
     def sh(*args, &block)
