@@ -1,3 +1,5 @@
+require "pry"
+
 class Bundix
   class Fetcher
     def sh(*args, &block)
@@ -60,7 +62,7 @@ class Bundix
 
       download(file, url) unless File.size?(file)
       return unless File.size?(file)
-
+      # binding.pry
       sh(
         Bundix::NIX_PREFETCH_URL,
         '--type', 'sha256',
@@ -91,31 +93,39 @@ class Bundix
       sh(NIX_HASH, '--type', 'sha256', '--to-base32', hash)[SHA256_32]
     end
 
+
     def fetch_local_hash(spec)
-      spec.source.caches.each do |cache|
-        path = File.join(cache, "#{spec.full_name}.gem")
-        next unless File.file?(path)
+      has_platform = spec.platform && spec.platform != Gem::Platform::RUBY
+      name_version = "#{spec.name}-#{spec.version}"
+      filename = has_platform ? "#{name_version}-*" : name_version
+
+      paths = spec.source.caches.map(&:to_s)
+      Dir.glob("{#{paths.join(',')}}/#{filename}.gem").each do |path|
+        if has_platform
+          platform = File.basename(path, '.gem')[(name_version.size + 1)..-1]
+          next unless Gem::Platform.match(platform)
+        end
+
         hash = nix_prefetch_url(path)[SHA256_32]
-        return format_hash(hash) if hash
+        return format_hash(hash), platform if hash
       end
 
       nil
     end
 
-    def fetch_remotes_hash(spec, remotes)
-      remotes.each do |remote|
-        hash = fetch_remote_hash(spec, remote)
-        return remote, format_hash(hash) if hash
+    def fetch_remotes_hash_and_platform(spec, remotes)
+      # TODO compose real fetcher with good sources
+      sources = Gem::SourceList.new
+      spec.source.remotes.each do |remote|
+        sources << remote
       end
-
-      nil
-    end
-
-    def fetch_remote_hash(spec, remote)
-      uri = "#{remote}/gems/#{spec.full_name}.gem"
+      # TODO handle errors
+      spec, source = Gem::SpecFetcher.new(sources).spec_for_dependency(Gem::Dependency.new(spec.name, spec.version)).first.first
+      remote = source.uri.to_s
+      uri = File.join(remote, "gems/#{spec.full_name}.gem")
       result = nix_prefetch_url(uri)
       return unless result
-      result[SHA256_32]
+      [remote, format_hash(result[SHA256_32]), spec.platform&.to_s]
     rescue => e
       puts "ignoring error during fetching: #{e}"
       puts e.backtrace
@@ -147,14 +157,18 @@ class Bundix
 
     def convert_rubygems
       remotes = spec.source.remotes.map{|remote| remote.to_s.sub(/\/+$/, '') }
-      hash = fetcher.fetch_local_hash(spec)
-      remote, hash = fetcher.fetch_remotes_hash(spec, remotes) unless hash
+      hash, platform = fetcher.fetch_local_hash(spec)
+      remote, hash, platform = fetcher.fetch_remotes_hash_and_platform(spec, remotes) unless hash
       fail "couldn't fetch hash for #{spec.full_name}" unless hash
-      puts "#{hash} => #{spec.full_name}.gem" if $VERBOSE
 
-      { type: 'gem',
+      new_version = "#{spec.name}-#{spec.version}"
+      new_version = "#{new_version}-#{platform}" if platform
+
+      puts "#{hash} => #{new_version}.gem" if $VERBOSE
+
+      [{ type: 'gem',
         remotes: (remote ? [remote] : remotes),
-        sha256: hash }
+        sha256: hash }, platform]
     end
 
     def convert_git
